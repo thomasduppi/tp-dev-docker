@@ -1,0 +1,6 @@
+# Les scripts et configs exécutés dans les conteneurs Linux doivent rester en LF,
+# même si le dépôt est cloné sous Windows (core.autocrlf=true).
+*.sh        text eol=lf
+*.conf      text eol=lf
+Dockerfile  text eol=lf
+*.tar.gz    binary
