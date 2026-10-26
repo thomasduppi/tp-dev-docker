@@ -1,28 +1,185 @@
+name: tictactoe
+
+# Toutes les valeurs ${...} viennent du fichier .env (valeurs par défaut après ":-").
+# Chaque service reçoit :
+#   - des limites de ressources (CPU, RAM, nombre de process) -> deploy.resources (cpus, memory, pids)
+#   - des arguments applicatifs qui dimensionnent le process -> environment
+
+x-hardening: &hardening
+  read_only: true                 # système de fichiers racine en lecture seule
+  tmpfs:
+    - /tmp:size=16m               # seul espace inscriptible (config nginx générée, pid...)
+  security_opt:
+    - no-new-privileges:true      # interdit toute élévation de privilèges (setuid...)
+  cap_drop: [ALL]                 # aucune capability Linux : ports > 1024, user non-root
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "2" }
+
 services:
+  # Image de base construite depuis "scratch". Ce service sert à la construire
+  # en premier : les autres services la référencent via
+  # "additional_contexts: service:base" (leurs Dockerfiles font
+  # FROM tictactoe/base:1.0). Au run, il affiche la version d'Alpine et s'arrête.
+  base:
+    image: tictactoe/base:1.0
+    build:
+      context: ./base
+      args:
+        ALPINE_VERSION: ${ALPINE_VERSION:-3.21.3}
+        ALPINE_ARCH: ${ALPINE_ARCH:-x86_64}
+    command: ["cat", "/etc/alpine-release"]
+    network_mode: none
+    restart: "no"
+
   backend:
-    build: ./backend
+    <<: *hardening
+    image: tictactoe/backend:1.0
+    build:
+      context: ./backend
+      additional_contexts:
+        tictactoe/base:1.0: service:base
     environment:
-      HOST: 0.0.0.0
-      PORT: 8081
-    mem_limit: ${BACKEND_MEMORY:-128m}
-    cpus: ${BACKEND_CPUS:-0.50}
-    restart: unless-stopped
+      PORT: ${BACKEND_PORT:-8081}
+      DB_PATH: /data/games.db
+      HISTORY_LIMIT: ${BACKEND_HISTORY_LIMIT:-20}
+      REQUEST_QUEUE_SIZE: ${BACKEND_REQUEST_QUEUE_SIZE:-64}
+    volumes:
+      - games-data:/data
+    networks: [internal]
+    deploy:
+      resources:
+        limits:
+          cpus: "${BACKEND_CPUS:-0.50}"
+          memory: ${BACKEND_MEMORY:-128M}
+          pids: ${BACKEND_PIDS:-64}
+        reservations:
+          cpus: "${BACKEND_CPUS_RESERVED:-0.10}"
+          memory: ${BACKEND_MEMORY_RESERVED:-32M}
+    stop_grace_period: 10s
 
   frontend:
-    build: ./frontend
-    mem_limit: ${FRONTEND_MEMORY:-128m}
-    cpus: ${FRONTEND_CPUS:-0.50}
-    restart: unless-stopped
+    <<: *hardening
+    image: tictactoe/frontend:1.0
+    build:
+      context: ./frontend
+      additional_contexts:
+        tictactoe/base:1.0: service:base
+    environment:
+      PORT: 8080
+      WORKER_PROCESSES: ${FRONTEND_WORKER_PROCESSES:-1}
+      WORKER_CONNECTIONS: ${FRONTEND_WORKER_CONNECTIONS:-256}
+    networks: [internal]
+    deploy:
+      resources:
+        limits:
+          cpus: "${FRONTEND_CPUS:-0.25}"
+          memory: ${FRONTEND_MEMORY:-64M}
+          pids: ${FRONTEND_PIDS:-32}
+        reservations:
+          cpus: "${FRONTEND_CPUS_RESERVED:-0.05}"
+          memory: ${FRONTEND_MEMORY_RESERVED:-16M}
+    stop_grace_period: 10s
 
   webserver:
-    build: ./webserver
+    <<: *hardening
+    image: tictactoe/webserver:1.0
+    build:
+      context: ./webserver
+      additional_contexts:
+        tictactoe/base:1.0: service:base
     ports:
-      - "${WEBSERVER_PORT:-8080}:80"
+      - "${WEBSERVER_PUBLIC_PORT:-8080}:8080"
+    environment:
+      PORT: 8080
+      WORKER_PROCESSES: ${WEBSERVER_WORKER_PROCESSES:-2}
+      WORKER_CONNECTIONS: ${WEBSERVER_WORKER_CONNECTIONS:-512}
+      CLIENT_MAX_BODY_SIZE: ${WEBSERVER_CLIENT_MAX_BODY_SIZE:-16k}
+      API_RATE_LIMIT: ${WEBSERVER_API_RATE_LIMIT:-20}
+      BACKEND_HOST: backend
+      BACKEND_PORT: ${BACKEND_PORT:-8081}
+      FRONTEND_HOST: frontend
+      FRONTEND_PORT: 8080
+    networks: [internal, public]
+    # Ordre de démarrage : le proxy n'est lancé qu'une fois le backend et le
+    # frontend déclarés "healthy" par leur HEALTHCHECK.
     depends_on:
       backend:
         condition: service_healthy
       frontend:
         condition: service_healthy
-    mem_limit: ${WEBSERVER_MEMORY:-64m}
-    cpus: ${WEBSERVER_CPUS:-0.25}
-    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${WEBSERVER_CPUS:-0.50}"
+          memory: ${WEBSERVER_MEMORY:-64M}
+          pids: ${WEBSERVER_PIDS:-32}
+        reservations:
+          cpus: "${WEBSERVER_CPUS_RESERVED:-0.05}"
+          memory: ${WEBSERVER_MEMORY_RESERVED:-16M}
+    stop_grace_period: 10s
+
+  # ---------------------------------------------------------------- CI/CD ---
+  # Conteneurs "one-shot" du profil "ci" : docker compose --profile ci run --rm lint|tests
+
+  lint:
+    image: tictactoe/lint:1.0
+    build:
+      context: ./ci/lint
+      additional_contexts:
+        tictactoe/base:1.0: service:base
+    profiles: [ci]
+    read_only: true
+    tmpfs: [/tmp:size=16m]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    environment:
+      FLAKE8_MAX_LINE_LENGTH: ${LINT_MAX_LINE_LENGTH:-110}
+    volumes:
+      - ./:/src:ro
+    network_mode: none            # le lint n'a besoin d'aucun accès réseau
+    deploy:
+      resources:
+        limits:
+          cpus: "${LINT_CPUS:-1.0}"
+          memory: ${LINT_MEMORY:-256M}
+          pids: ${LINT_PIDS:-64}
+
+  tests:
+    image: tictactoe/tests:1.0
+    build:
+      context: ./ci/tests
+      additional_contexts:
+        tictactoe/base:1.0: service:base
+    profiles: [ci]
+    read_only: true
+    tmpfs: [/tmp:size=16m]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    environment:
+      BASE_URL: http://webserver:8080
+      BACKEND_SRC: /backend
+      TEST_TIMEOUT: ${TESTS_TIMEOUT:-5}
+    volumes:
+      - ./backend:/backend:ro
+    networks: [public]
+    # Les tests d'intégration ont besoin de toute la stack opérationnelle.
+    depends_on:
+      webserver:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "${TESTS_CPUS:-0.50}"
+          memory: ${TESTS_MEMORY:-128M}
+          pids: ${TESTS_PIDS:-32}
+
+networks:
+  # Réseau privé : backend et frontend ne sont joignables QUE par le proxy.
+  internal:
+    internal: true
+  public: {}
+
+volumes:
+  games-data:
